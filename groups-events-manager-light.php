@@ -15,7 +15,7 @@
  * @since 1.0.0
  *
  * Plugin Name: Groups Events Manager Light
- * Plugin URI: http://www.itthinx.com/plugins/groups-events-manager-light/
+ * Plugin URI: http://www.itthinx.com/plugins/groups-events-manager/
  * Description: Integrates Groups with Events Manager.
  * Author: itthinx
  * Author URI: http://www.itthinx.com/
@@ -30,7 +30,7 @@ define( 'GROUPS_EM_PLUGIN_URL', WP_PLUGIN_URL . '/groups-events-manager-light' )
 define( 'GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN', 'groups-events-manager-light' );
 
 /**
- * Events Manager integration.
+ * Groups Events Manager integration.
  */
 class Groups_Events_Manager_Light {
 	
@@ -40,6 +40,14 @@ class Groups_Events_Manager_Light {
 	const DEFAULT_STRING = '';
 	const GROUPS_EM_NONCE = 'groups_eml_nonce';
 	const GROUPS_EM_ADMIN_OPTIONS = 'set_admin_options';
+	
+	// Events Manager uses magic numbers
+	const BOOKING_STATUS_UNAPPROVED              = 0;
+	const BOOKING_STATUS_APPROVED                = 1;
+	const BOOKING_STATUS_REJECTED                = 2;
+	const BOOKING_STATUS_CANCELLED               = 3;
+	const BOOKING_STATUS_AWAITING_ONLINE_PAYMENT = 4;
+	const BOOKING_STATUS_AWAITING_PAYMENT        = 5;
 	
 	private static $admin_messages = array();
 	
@@ -84,6 +92,7 @@ class Groups_Events_Manager_Light {
 		if ( $verified ) {
 			add_action( 'groups_admin_menu', array( __CLASS__, 'groups_admin_menu' ) );
 			add_filter( 'em_booking_set_status', array( __CLASS__, 'em_booking_set_status' ), 10, 2 );
+			add_filter( 'em_booking_delete', array( __CLASS__, 'em_booking_delete' ), 10, 2 );
 		}
 	}
 	
@@ -108,6 +117,7 @@ class Groups_Events_Manager_Light {
 		global $wpdb;
 		
 		$output = '';
+		Groups_UIE::enqueue( 'select' );
 		if ( !current_user_can( GROUPS_ADMINISTER_OPTIONS ) ) {
 			wp_die( __( 'Access denied.', 'GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN' ) );
 		}
@@ -120,29 +130,35 @@ class Groups_Events_Manager_Light {
 		}
 	
 		$chosen_groups = isset( $options[self::CHOSEN_GROUPS] ) ? $options[self::CHOSEN_GROUPS] : self::DEFAULT_STRING;
-	
 		
 		$output .=
 		'<div>' .
 		'<h2>' .
 		__( 'Groups Events Manager Integration Light', 'GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN' ) .
 		'</h2>' .
-		'</div>';
+		'</div>';		
+		// @todo change this paragraph a bit
+		$output .= '<p>' . __( 'Choose the group(s) where the users will be added after their booking is approved.', GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN ) . '</p>';		
 		$output .= '<form action="" name="options" method="post">';
 		$groups_table = _groups_get_tablename( 'group' );
 		if ( $groups = $wpdb->get_results( "SELECT * FROM $groups_table ORDER BY name" ) ) {
 			$output .= '<style type="text/css">';
+			$output .= '.select_groups { width: 45%; }';
 			$output .= '.groups .selectize-input { font-size: inherit; }';
 			$output .= '</style>';
+			$output .= '<label>';
+			$output .= __( 'Select Groups', GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN );
 			$output .= sprintf(
-				'<select class="select groups" name="chosen_groups" placeholder="%s">',
-				__( 'Choose groups &hellip;', GROUPS_PLUGIN_DOMAIN )
+				'<select class="select_groups" name="chosen_groups[]" placeholder="%s" multiple="multiple">',
+				__( 'Choose groups &hellip;', GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN )
 			);
 			foreach( $groups as $group ) {
-					$output .= sprintf( '<option value="%d" %s>%s</option>', Groups_Utility::id( $group->group_id ), $chosen_groups == $group->group_id ? ' selected ' : '', wp_filter_nohtml_kses( $group->name ) );
+					$output .= sprintf( '<option value="%d" %s>%s</option>', Groups_Utility::id( $group->group_id ), in_array( $group->group_id, $chosen_groups ) ? ' selected ' : '', wp_filter_nohtml_kses( $group->name ) );
 			}
-			$output .= '</select>';		
-			$output .= '<p class="description">' . __( 'Users will be added to the selected Group after their booking has been approved.', GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN ) . '</p>';
+			$output .= '</select>';	
+			$output .= '</label>';	
+			$output .= Groups_UIE::render_select( '.select_groups' );
+			$output .= '<p class="description">' . __( 'Users will be added to the selected Group(s) after their booking has been approved.', GROUPS_EVENTS_MANAGER_PLUGIN_DOMAIN ) . '</p>';
 		}
 		$output .= '<p class="manage" style="padding:1em;margin-right:1em;font-weight:bold;font-size:1em;line-height:1.62em">';
 		$output .= wp_nonce_field( self::GROUPS_EM_ADMIN_OPTIONS, self::GROUPS_EM_NONCE, true, false );
@@ -154,7 +170,7 @@ class Groups_Events_Manager_Light {
 	}
 	
 	/**
-	 * Add user to group after an approved booking.
+	 * Add/remove user to/from group based on the booking status.
 	 *
 	 * @param EM_Booking $em_booking
 	 * @param int $status 
@@ -163,25 +179,52 @@ class Groups_Events_Manager_Light {
 	public static function em_booking_set_status( $status, $em_booking ) {
 		$booking_status = $em_booking->booking_status;
 		$options = get_option( self::PLUGIN_OPTIONS , array() );
-		$group_id = $options[self::CHOSEN_GROUPS];
+		$group_ids = $options[ self::CHOSEN_GROUPS ];
 		if ( $person = $em_booking->get_person() ) {
 			$user_id = $person->ID;
 		}
-		switch ( $booking_status ) {
-			case   1:			
-				if ( !Groups_User_Group::read( $user_id, $group_id ) ) {
-					Groups_User_Group::create( array( 'user_id' => $user_id, 'group_id' => $group_id ) );
-				}
-				break;
-			case   0:
-			case   2:
-			case   3:
-				if ( Groups_User_Group::read( $user_id, $group_id ) ) {
-					Groups_User_Group::delete( $user_id, $group_id );
-				}				
-				break;
+		foreach ( $group_ids as $group_id ) {
+			switch ( $booking_status ) {
+				case   1:			
+					if ( !Groups_User_Group::read( $user_id, $group_id ) ) {
+						Groups_User_Group::create( array( 'user_id' => $user_id, 'group_id' => $group_id ) );
+					}
+					break;
+				case   0:
+				case   2:
+				case   3:
+					if ( Groups_User_Group::read( $user_id, $group_id ) ) {
+						Groups_User_Group::delete( $user_id, $group_id );
+					}				
+					break;
+			}
 		}
 		
 		return $status;
 	}	
+	
+	/**
+	 * Remove user from group(s) when a booking is deleted
+	 * 
+	 * @param int $result
+	 * @param object $em_booking
+	 * @return int
+	 */
+	public static function em_booking_delete( $result, $em_booking ) {	
+		$options = get_option( self::PLUGIN_OPTIONS , array() );
+		$group_ids = $options[ self::CHOSEN_GROUPS ];
+		
+		if ( $result !== false ) {
+			if ( $person = $em_booking->get_person() ) {
+				$user_id = $person->ID;
+			}
+			foreach ( $group_ids as $group_id ) {			
+				if ( Groups_User_Group::read( $user_id, $group_id ) ) {
+					Groups_User_Group::delete( $user_id, $group_id );
+				}
+			}
+		}
+		
+		return $result;
+	}
 } Groups_Events_Manager_Light::init();
